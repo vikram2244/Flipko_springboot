@@ -6,6 +6,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
@@ -62,8 +63,8 @@ public class ServiceImp implements UserService {
     private final UserRepo userRepo;
     private final ObjectMapper objectMapper;
 
-    private static final String BASE_API_URL = "http://localhost:4000";
-
+    @Value("${api.base-url}")
+    private String BASE_API_URL;
     public ServiceImp(MobileRepo mobileRepo, AcRepo acRepo, BooksRepo booksRepo, ComputerRepo computerRepo,
                       FridgesRepo fridgeRepo, FurnitureRepo furnitureRepo, KitchenRepo kitchenRepo, MenRepo menRepo,
                       SpeakersRepo speakersRepo, TvRepo tvsRepo, WatchesRepo watchesRepo, WomenRepo womenRepo,
