@@ -9,7 +9,7 @@ import jakarta.persistence.Table;
 @Entity
 @Table(name = "mobilefetch")
 @JsonIgnoreProperties(ignoreUnknown = true)
-public class MobileEntity {
+public class MobileEntity extends BaseEntity{
 
     @Id
     private Integer id; // Must be Integer to match parsedId

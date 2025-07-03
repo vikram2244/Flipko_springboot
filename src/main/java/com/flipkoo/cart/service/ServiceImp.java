@@ -1,53 +1,26 @@
 package com.flipkoo.cart.service;
 
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.client.RestTemplate;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.flipkoo.cart.entity.AcEntity;
-import com.flipkoo.cart.entity.BooksEntity;
-import com.flipkoo.cart.entity.CartEntity;
-import com.flipkoo.cart.entity.ComputerEntity;
-import com.flipkoo.cart.entity.FridgeEntity;
-import com.flipkoo.cart.entity.FurnitureEntity;
-import com.flipkoo.cart.entity.KitchenData;
-import com.flipkoo.cart.entity.LoginEntity;
-import com.flipkoo.cart.entity.MenData;
-import com.flipkoo.cart.entity.MobileEntity;
-import com.flipkoo.cart.entity.SpeakersData;
-import com.flipkoo.cart.entity.TvsData;
-import com.flipkoo.cart.entity.WatchesData;
-import com.flipkoo.cart.entity.WomenData;
-import com.flipkoo.cart.entity.UserEntity;
-import com.flipkoo.cart.repo.AcRepo;
-import com.flipkoo.cart.repo.BooksRepo;
-import com.flipkoo.cart.repo.CartRepository;
-import com.flipkoo.cart.repo.ComputerRepo;
-import com.flipkoo.cart.repo.FridgesRepo;
-import com.flipkoo.cart.repo.FurnitureRepo;
-import com.flipkoo.cart.repo.KitchenRepo;
-import com.flipkoo.cart.repo.LoginRepo;
-import com.flipkoo.cart.repo.MenRepo;
-import com.flipkoo.cart.repo.MobileRepo;
-import com.flipkoo.cart.repo.SpeakersRepo;
-import com.flipkoo.cart.repo.TvRepo;
-import com.flipkoo.cart.repo.WatchesRepo;
-import com.flipkoo.cart.repo.WomenRepo;
-import com.flipkoo.cart.repo.UserRepo;
+import com.flipkoo.cart.entity.*;
+import com.flipkoo.cart.repo.*;
 
 @Service
+@Transactional
 public class ServiceImp implements UserService {
 
     private final RestTemplate restTemplate;
-    private CartRepository cartRepository;
-    
+    private final CartRepository cartRepository;
     private final MobileRepo mobileRepo;
     private final AcRepo acRepo;
     private final BooksRepo booksRepo;
@@ -65,10 +38,16 @@ public class ServiceImp implements UserService {
 
     @Value("${api.base-url}")
     private String BASE_API_URL;
+
+    // Cache for product data
+    private final Map<String, List<?>> productCache = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
     public ServiceImp(MobileRepo mobileRepo, AcRepo acRepo, BooksRepo booksRepo, ComputerRepo computerRepo,
-                      FridgesRepo fridgeRepo, FurnitureRepo furnitureRepo, KitchenRepo kitchenRepo, MenRepo menRepo,
-                      SpeakersRepo speakersRepo, TvRepo tvsRepo, WatchesRepo watchesRepo, WomenRepo womenRepo,
-                      RestTemplate restTemplate, UserRepo userRepo, ObjectMapper objectMapper,CartRepository cartRepository) {
+                     FridgesRepo fridgeRepo, FurnitureRepo furnitureRepo, KitchenRepo kitchenRepo, MenRepo menRepo,
+                     SpeakersRepo speakersRepo, TvRepo tvsRepo, WatchesRepo watchesRepo, WomenRepo womenRepo,
+                     RestTemplate restTemplate, UserRepo userRepo, ObjectMapper objectMapper, 
+                     CartRepository cartRepository) {
         this.mobileRepo = mobileRepo;
         this.acRepo = acRepo;
         this.booksRepo = booksRepo;
@@ -85,115 +64,139 @@ public class ServiceImp implements UserService {
         this.userRepo = userRepo;
         this.objectMapper = objectMapper;
         this.cartRepository = cartRepository;
+
+        // Initialize cache refresh scheduler
+        scheduler.scheduleAtFixedRate(this::refreshAllCaches, 5, 30, TimeUnit.MINUTES);
+    }
+
+    // Generic method to handle all product types
+    private <T> List<T> getProductData(String endpoint, Class<T[]> clazz, JpaRepository<T, Integer> repo) {
+        List<T> cached = (List<T>) productCache.get(endpoint);
+        if (cached != null) {
+            return cached;
+        }
+        T[] dataArray = restTemplate.getForObject(BASE_API_URL + endpoint, clazz);
+        if (dataArray == null) {
+            return Collections.emptyList();
+        }
+        Set<Integer> existingIds = repo.findAllById(
+            Arrays.stream(dataArray)
+                .map(this::getIdFromEntity)
+                .collect(Collectors.toList())
+        ).stream()
+        .map(this::getIdFromEntity)
+        .collect(Collectors.toSet());
+
+        // Filter and save new items
+        List<T> newData = Arrays.stream(dataArray)
+            .filter(entity -> !existingIds.contains(getIdFromEntity(entity)))
+            .collect(Collectors.toList());
+
+        if (!newData.isEmpty()) {
+            repo.saveAll(newData);
+        }
+
+        // Get all data from DB (including newly saved)
+        List<T> allData = repo.findAll();
+        
+        // Update cache
+        productCache.put(endpoint, allData);
+        
+        return allData;
+    }
+
+    private <T> Integer getIdFromEntity(T entity) {
+        if (entity instanceof MobileEntity) return ((MobileEntity) entity).getId();
+        if (entity instanceof AcEntity) return ((AcEntity) entity).getId();
+        if (entity instanceof BooksEntity) return ((BooksEntity) entity).getId();
+        if (entity instanceof ComputerEntity) return ((ComputerEntity) entity).getId();
+        if (entity instanceof FridgeEntity) return ((FridgeEntity) entity).getId();
+        if (entity instanceof FurnitureEntity) return ((FurnitureEntity) entity).getId();
+        if (entity instanceof KitchenData) return ((KitchenData) entity).getId();
+        if (entity instanceof MenData) return ((MenData) entity).getId();
+        if (entity instanceof SpeakersData) return ((SpeakersData) entity).getId();
+        if (entity instanceof TvsData) return ((TvsData) entity).getId();
+        if (entity instanceof WatchesData) return ((WatchesData) entity).getId();
+        if (entity instanceof WomenData) return ((WomenData) entity).getId();
+        throw new IllegalArgumentException("Unsupported entity type");
+    }
+
+    @Async
+    public void refreshAllCaches() {
+        productCache.clear();
+        // Pre-load all caches in background
+        getMobilesData();
+        getAcData();
+        getBooksData();
+        getComputerData();
+        getFridgeData();
+        getFurnitureData();
+        getKitchenData();
+        getMenData();
+        getSpeakersData();
+        getTvsData();
+        getWatchesData();
+        getWomenData();
     }
 
     @Override
     public List<MobileEntity> getMobilesData() {
-        MobileEntity[] dataArray = restTemplate.getForObject(BASE_API_URL + "/mobiles", MobileEntity[].class);
-        List<MobileEntity> newData = Arrays.stream(dataArray).filter(entity -> !mobileRepo.existsById(entity.getId()))
-                .collect(Collectors.toList());
-        mobileRepo.saveAll(newData);
-        return mobileRepo.findAll();
+        return getProductData("/mobiles", MobileEntity[].class, mobileRepo);
     }
 
     @Override
     public List<AcEntity> getAcData() {
-        AcEntity[] dataArray = restTemplate.getForObject(BASE_API_URL + "/ac", AcEntity[].class);
-        List<AcEntity> newData = Arrays.stream(dataArray).filter(entity -> !acRepo.existsById(entity.getId()))
-                .collect(Collectors.toList());
-        acRepo.saveAll(newData);
-        return acRepo.findAll();
+        return getProductData("/ac", AcEntity[].class, acRepo);
     }
 
     @Override
-    public
-    List<BooksEntity> getBooksData() {
-        BooksEntity[] dataArray = restTemplate.getForObject(BASE_API_URL + "/books", BooksEntity[].class);
-        List<BooksEntity> newData = Arrays.stream(dataArray).filter(entity -> !booksRepo.existsById(entity.getId()))
-                .collect(Collectors.toList());
-        booksRepo.saveAll(newData);
-        return booksRepo.findAll();
+    public List<BooksEntity> getBooksData() {
+        return getProductData("/books", BooksEntity[].class, booksRepo);
     }
 
     @Override
     public List<ComputerEntity> getComputerData() {
-        ComputerEntity[] dataArray = restTemplate.getForObject(BASE_API_URL + "/computers", ComputerEntity[].class);
-        List<ComputerEntity> newData = Arrays.stream(dataArray)
-                .filter(entity -> !computerRepo.existsById(entity.getId())).collect(Collectors.toList());
-        computerRepo.saveAll(newData);
-        return computerRepo.findAll();
+        return getProductData("/computers", ComputerEntity[].class, computerRepo);
     }
 
     @Override
     public List<FridgeEntity> getFridgeData() {
-        FridgeEntity[] dataArray = restTemplate.getForObject(BASE_API_URL + "/fridges", FridgeEntity[].class);
-        List<FridgeEntity> newData = Arrays.stream(dataArray).filter(entity -> !fridgeRepo.existsById(entity.getId()))
-                .collect(Collectors.toList());
-        fridgeRepo.saveAll(newData);
-        return fridgeRepo.findAll();
+        return getProductData("/fridges", FridgeEntity[].class, fridgeRepo);
     }
 
     @Override
     public List<FurnitureEntity> getFurnitureData() {
-        FurnitureEntity[] dataArray = restTemplate.getForObject(BASE_API_URL + "/furniture", FurnitureEntity[].class);
-        List<FurnitureEntity> newData = Arrays.stream(dataArray)
-                .filter(entity -> !furnitureRepo.existsById(entity.getId())).collect(Collectors.toList());
-        furnitureRepo.saveAll(newData);
-        return furnitureRepo.findAll();
+        return getProductData("/furniture", FurnitureEntity[].class, furnitureRepo);
     }
 
     @Override
     public List<KitchenData> getKitchenData() {
-        KitchenData[] dataArray = restTemplate.getForObject(BASE_API_URL + "/kitchen", KitchenData[].class);
-        List<KitchenData> newData = Arrays.stream(dataArray).filter(entity -> !kitchenRepo.existsById(entity.getId()))
-                .collect(Collectors.toList());
-        kitchenRepo.saveAll(newData);
-        return kitchenRepo.findAll();
+        return getProductData("/kitchen", KitchenData[].class, kitchenRepo);
     }
 
     @Override
     public List<MenData> getMenData() {
-        MenData[] dataArray = restTemplate.getForObject(BASE_API_URL + "/men", MenData[].class);
-        List<MenData> newData = Arrays.stream(dataArray).filter(entity -> !menRepo.existsById(entity.getId()))
-                .collect(Collectors.toList());
-        menRepo.saveAll(newData);
-        return menRepo.findAll();
+        return getProductData("/men", MenData[].class, menRepo);
     }
 
     @Override
     public List<SpeakersData> getSpeakersData() {
-        SpeakersData[] dataArray = restTemplate.getForObject(BASE_API_URL + "/speakers", SpeakersData[].class);
-        List<SpeakersData> newData = Arrays.stream(dataArray).filter(entity -> !speakersRepo.existsById(entity.getId()))
-                .collect(Collectors.toList());
-        speakersRepo.saveAll(newData);
-        return speakersRepo.findAll();
+        return getProductData("/speakers", SpeakersData[].class, speakersRepo);
     }
 
     @Override
     public List<TvsData> getTvsData() {
-        TvsData[] dataArray = restTemplate.getForObject(BASE_API_URL + "/tvs", TvsData[].class);
-        List<TvsData> newData = Arrays.stream(dataArray).filter(entity -> !tvsRepo.existsById(entity.getId()))
-                .collect(Collectors.toList());
-        tvsRepo.saveAll(newData);
-        return tvsRepo.findAll();
+        return getProductData("/tvs", TvsData[].class, tvsRepo);
     }
 
     @Override
     public List<WatchesData> getWatchesData() {
-        WatchesData[] dataArray = restTemplate.getForObject(BASE_API_URL + "/watches", WatchesData[].class);
-        List<WatchesData> newData = Arrays.stream(dataArray).filter(entity -> !watchesRepo.existsById(entity.getId()))
-                .collect(Collectors.toList());
-        watchesRepo.saveAll(newData);
-        return watchesRepo.findAll();
+        return getProductData("/watches", WatchesData[].class, watchesRepo);
     }
 
     @Override
     public List<WomenData> getWomenData() {
-        WomenData[] dataArray = restTemplate.getForObject(BASE_API_URL + "/women", WomenData[].class);
-        List<WomenData> newData = Arrays.stream(dataArray).filter(entity -> !womenRepo.existsById(entity.getId()))
-                .collect(Collectors.toList());
-        womenRepo.saveAll(newData);
-        return womenRepo.findAll();
+        return getProductData("/women", WomenData[].class, womenRepo);
     }
 
     @Override
@@ -212,8 +215,7 @@ public class ServiceImp implements UserService {
         if (userEntity == null || userEntity.getEmail() == null || userEntity.getPassword() == null) {
             return false;
         }
-        Optional<UserEntity> existingUser = userRepo.findByEmail(userEntity.getEmail());
-        return existingUser.isPresent();
+        return userRepo.findByEmail(userEntity.getEmail()).isPresent();
     }
 
     @Override
@@ -221,11 +223,7 @@ public class ServiceImp implements UserService {
         if (loginEntity == null || loginEntity.getEmail() == null || loginEntity.getPassword() == null) {
             return false;
         }
-        Optional<UserEntity> userOpt = userRepo.findByEmail(loginEntity.getEmail());
-        if (userOpt.isPresent()) {
-            return userOpt.get().getPassword().equals(loginEntity.getPassword());
-        }
-        return false;
+        return userRepo.findByEmailAndPassword(loginEntity.getEmail(), loginEntity.getPassword()).isPresent();
     }
 
     @Override
@@ -233,41 +231,29 @@ public class ServiceImp implements UserService {
         try {
             switch (names.toLowerCase()) {
                 case "mobiles":
-                    MobileEntity mobileEntity = objectMapper.convertValue(productData, MobileEntity.class);
-                    return mobileRepo.save(mobileEntity);
+                    return saveProductInternal(productData, MobileEntity.class, mobileRepo);
                 case "ac":
-                    AcEntity acEntity = objectMapper.convertValue(productData, AcEntity.class);
-                    return acRepo.save(acEntity);
+                    return saveProductInternal(productData, AcEntity.class, acRepo);
                 case "books":
-                    BooksEntity booksEntity = objectMapper.convertValue(productData, BooksEntity.class);
-                    return booksRepo.save(booksEntity);
+                    return saveProductInternal(productData, BooksEntity.class, booksRepo);
                 case "computers":
-                    ComputerEntity computerEntity = objectMapper.convertValue(productData, ComputerEntity.class);
-                    return computerRepo.save(computerEntity);
+                    return saveProductInternal(productData, ComputerEntity.class, computerRepo);
                 case "fridges":
-                    FridgeEntity fridgeEntity = objectMapper.convertValue(productData, FridgeEntity.class);
-                    return fridgeRepo.save(fridgeEntity);
+                    return saveProductInternal(productData, FridgeEntity.class, fridgeRepo);
                 case "furniture":
-                    FurnitureEntity furnitureEntity = objectMapper.convertValue(productData, FurnitureEntity.class);
-                    return furnitureRepo.save(furnitureEntity);
+                    return saveProductInternal(productData, FurnitureEntity.class, furnitureRepo);
                 case "kitchen":
-                    KitchenData kitchenData = objectMapper.convertValue(productData, KitchenData.class);
-                    return kitchenRepo.save(kitchenData);
+                    return saveProductInternal(productData, KitchenData.class, kitchenRepo);
                 case "men":
-                    MenData menData = objectMapper.convertValue(productData, MenData.class);
-                    return menRepo.save(menData);
+                    return saveProductInternal(productData, MenData.class, menRepo);
                 case "speakers":
-                    SpeakersData speakersData = objectMapper.convertValue(productData, SpeakersData.class);
-                    return speakersRepo.save(speakersData);
+                    return saveProductInternal(productData, SpeakersData.class, speakersRepo);
                 case "tvs":
-                    TvsData tvsData = objectMapper.convertValue(productData, TvsData.class);
-                    return tvsRepo.save(tvsData);
+                    return saveProductInternal(productData, TvsData.class, tvsRepo);
                 case "watches":
-                    WatchesData watchesData = objectMapper.convertValue(productData, WatchesData.class);
-                    return watchesRepo.save(watchesData);
+                    return saveProductInternal(productData, WatchesData.class, watchesRepo);
                 case "women":
-                    WomenData womenData = objectMapper.convertValue(productData, WomenData.class);
-                    return womenRepo.save(womenData);
+                    return saveProductInternal(productData, WomenData.class, womenRepo);
                 default:
                     throw new IllegalArgumentException("Invalid product type: " + names);
             }
@@ -278,6 +264,13 @@ public class ServiceImp implements UserService {
         }
     }
 
+    private <T> T saveProductInternal(Object productData, Class<T> clazz, JpaRepository<T, Integer> repo) {
+        T entity = objectMapper.convertValue(productData, clazz);
+        T saved = repo.save(entity);
+        productCache.clear(); // Invalidate cache
+        return saved;
+    }
+
     @Override
     public Object updateProduct(String productType, String id, Object productData) {
         try {
@@ -285,64 +278,77 @@ public class ServiceImp implements UserService {
                 throw new IllegalArgumentException("Product type, ID, and data cannot be null");
             }
 
-            Integer parsedId;
-            try {
-                parsedId = Integer.parseInt(id);
-            } catch (NumberFormatException e) {
-                throw new IllegalArgumentException("Invalid ID format: " + id, e);
-            }
+            Integer parsedId = Integer.parseInt(id);
 
             switch (productType.toLowerCase()) {
                 case "mobiles":
-                    MobileEntity existingMobile = mobileRepo.findById(parsedId)
-                            .orElseThrow(() -> new IllegalArgumentException("Mobile with ID " + id + " not found"));
-                    MobileEntity updatedMobile = objectMapper.convertValue(productData, MobileEntity.class);
-                    updatedMobile.setId(parsedId);
-                    return mobileRepo.save(updatedMobile);
+                    return updateProductInternal(parsedId, productData, MobileEntity.class, mobileRepo);
                 case "ac":
-                    AcEntity existingAc = acRepo.findById(parsedId)
-                            .orElseThrow(() -> new IllegalArgumentException("AC with ID " + id + " not found"));
-                    AcEntity updatedAc = objectMapper.convertValue(productData, AcEntity.class);
-                    return acRepo.save(updatedAc);
+                    return updateProductInternal(parsedId, productData, AcEntity.class, acRepo);
+                // Add other cases as needed
                 default:
                     throw new IllegalArgumentException("Invalid product type: " + productType);
             }
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid ID format: " + id, e);
         } catch (IllegalArgumentException e) {
             throw e;
         } catch (Exception e) {
             throw new IllegalStateException("Failed to update product: " + e.getMessage(), e);
         }
     }
+
+    private <T> T updateProductInternal(Integer id, Object productData, Class<T> clazz, JpaRepository<T, Integer> repo) {
+        T existing = repo.findById(id)
+                .orElseThrow(() -> new IllegalArgumentException(clazz.getSimpleName() + " with ID " + id + " not found"));
+        T updated = objectMapper.convertValue(productData, clazz);
+        // Preserve the ID
+        if (updated instanceof BaseEntity) {
+            ((BaseEntity) updated).setId(id);
+        }
+        productCache.clear(); // Invalidate cache
+        return repo.save(updated);
+    }
+
     @Override
     public CartEntity addToCart(String userId, Integer productId, String productType, Object productDetails) {
         CartEntity existingCartItem = cartRepository.findByUserIdAndProductIdAndProductType(userId, productId, productType);
+        
         if (existingCartItem != null) {
             existingCartItem.setQuantity(existingCartItem.getQuantity() + 1);
             return cartRepository.save(existingCartItem);
-        } else {
-            CartEntity cartItem = new CartEntity();
-            cartItem.setUserId(userId);
-            cartItem.setProductId(productId);
-            cartItem.setProductType(productType);
-            cartItem.setQuantity(1);
-            if (productDetails instanceof Map) {
-                Map<String, Object> details = (Map) productDetails;
-                cartItem.setBrand((String) details.get("brand"));
-                cartItem.setModel((String) details.get("model"));
-                cartItem.setPrice(details.get("price") instanceof String 
-                    ? Double.parseDouble((String) details.get("price")) 
-                    : ((Number) details.get("price")).doubleValue());
-                cartItem.setImage((String) details.get("image"));
-                cartItem.setCategory((String) details.get("category"));
-                cartItem.setDescription((String) details.get("description"));
-            }
-            return cartRepository.save(cartItem);
         }
+
+        CartEntity cartItem = new CartEntity();
+        cartItem.setUserId(userId);
+        cartItem.setProductId(productId);
+        cartItem.setProductType(productType);
+        cartItem.setQuantity(1);
+
+        if (productDetails instanceof Map) {
+            Map<String, Object> details = (Map<String, Object>) productDetails;
+            cartItem.setBrand((String) details.get("brand"));
+            cartItem.setModel((String) details.get("model"));
+            cartItem.setPrice(parsePrice(details.get("price")));
+            cartItem.setImage((String) details.get("image"));
+            cartItem.setCategory((String) details.get("category"));
+            cartItem.setDescription((String) details.get("description"));
+        }
+
+        return cartRepository.save(cartItem);
     }
+
+    private double parsePrice(Object priceObj) {
+        if (priceObj instanceof String) {
+            return Double.parseDouble((String) priceObj);
+        } else if (priceObj instanceof Number) {
+            return ((Number) priceObj).doubleValue();
+        }
+        throw new IllegalArgumentException("Invalid price format");
+    }
+
     @Override
     public List<CartEntity> getCartByUserId(String userId) {
         return cartRepository.findByUserId(userId);
     }
 }
-
-    

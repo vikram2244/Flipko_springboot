@@ -41,6 +41,7 @@ public interface UserService {
 	Object updateProduct(String productType, String id, Object productData);
 	CartEntity addToCart(String userId, Integer productId, String productType, Object productDetails);
     List<CartEntity> getCartByUserId(String userId);
+    
 	
 	
 }
